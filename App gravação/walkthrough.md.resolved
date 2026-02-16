@@ -1,0 +1,85 @@
+# Medical Scribe — Walkthrough
+
+## O que foi construído
+
+Aplicação web completa de **Scribe Médico** multiplataforma (UBS, PS, UTI, Consultório) com 9 arquivos em `C:\Users\Usuário\.gemini\antigravity\scratch\medical-scribe\`.
+
+## Arquitetura
+
+```mermaid
+graph LR
+    A[🎤 Gravação/Texto] --> B[🔒 LGPD]
+    B --> C[🧠 SOAP Engine]
+    C --> D[📋 Revisão SOAP]
+    C --> E[📝 Documentos]
+    C --> F[📊 BI Dashboard]
+    E --> G[✅ Validação Médica]
+    G --> H[📄 PDF / 📋 Clipboard]
+```
+
+## Fluxo de Uso
+
+### 1. Gravação (tela inicial)
+- Botão central pulsante com gravação por **Web Speech API** (Chrome)
+- **Fallback**: campo de texto para digitar/colar transcrição
+- Botão "📋 Usar Exemplo" para testar com consulta demo
+
+### 2. Dados do Paciente
+| Campo | Regra LGPD |
+|-------|-----------|
+| Nome Completo | Convertido para iniciais (J.O.S.) — **original nunca é armazenado** |
+| Idade | Mantida |
+| Cenário | UBS, PS, UTI ou Consultório |
+
+### 3. Processamento SOAP
+O [soap-engine.js](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/js/soap-engine.js) faz:
+- **Diarização** simulada: separa falas de médico vs paciente
+- Estruturação **SOAP** (Subjetivo, Objetivo, Avaliação, Plano)
+- Extração do JSON Universal: `HDA_Tecnica`, `Comorbidades`, `Alergias` (CAIXA ALTA), `Medicações_Atuais`
+- Detecção automática de **CID-10** (~45 condições mapeadas)
+- Estimativa de **gravidade** (Leve/Moderada/Grave)
+
+### 4. Documentos Gerados
+| Documento | Descrição |
+|-----------|-----------|
+| 💊 **Receituário** | Itens, doses, via, posologia e duração |
+| 📄 **Atestado** | CID-10, dias sugeridos por gravidade, texto padrão |
+| 🔬 **Pedido de Exames** | Lista baseada na categoria CID, com checkboxes |
+| ❤️ **Guia Leiga** | Resumo em linguagem simples para o paciente |
+
+Todos são editáveis (contenteditable) e requerem **"✅ Validado pelo Médico Assistente"** via modal confirmação.
+
+### 5. Dashboard BI
+- 4 cards de KPIs (total atendimentos, graves, cenários, CIDs únicos)
+- 4 gráficos Chart.js (bar, doughnut, horizontal bar, line)
+- Tabela dos últimos 15 registros
+- Botão "Carregar Dados Demo" (50 registros aleatórios)
+
+### 6. Exportação
+- **📋 Clipboard**: individual ou "picotados" (todos juntos)
+- **📄 PDF**: via html2pdf.js com cabeçalho timbrado e rodapé LGPD
+- PDFs só podem ser gerados **após validação médica**
+
+## Como Testar
+
+1. Abrir `index.html` no **Chrome** (melhor suporte a Speech API)
+2. Clicar **"📋 Usar Exemplo"** para preencher com consulta demo
+3. Clicar **"🧠 Processar Consulta"**
+4. Revisar cards SOAP na aba "Revisão SOAP"
+5. Na aba "Documentos", **validar** cada documento e testar export
+6. Na aba "Dashboard BI", carregar dados demo para ver gráficos
+
+## Módulos Criados
+
+| Arquivo | Tamanho | Função |
+|---------|---------|--------|
+| [index.html](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/index.html) | 12KB | SPA shell (4 seções) |
+| [styles.css](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/css/styles.css) | CSS | Dark mode + glassmorphism |
+| [app.js](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/js/app.js) | 23KB | Controlador principal |
+| [soap-engine.js](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/js/soap-engine.js) | 13KB | Motor SOAP + diarização |
+| [bi-module.js](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/js/bi-module.js) | 13KB | Dashboards Chart.js |
+| [export.js](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/js/export.js) | 11KB | Clipboard + PDF |
+| [documents.js](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/js/documents.js) | 9KB | Gerador de documentos |
+| [db.js](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/js/db.js) | 6KB | IndexedDB wrapper |
+| [lgpd.js](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/js/lgpd.js) | 3KB | Anonimização LGPD |
+| [recorder.js](file:///C:/Users/Usuário/.gemini/antigravity/scratch/medical-scribe/js/recorder.js) | 4KB | Speech-to-Text |
