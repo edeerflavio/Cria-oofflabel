@@ -1,0 +1,54 @@
+###############################################
+# Medical Scribe Enterprise — Docker Compose
+# FastAPI + PostgreSQL + Angular (Nginx)
+###############################################
+
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL ──
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: senha123
+      POSTGRES_DB: medical_scribe
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d medical_scribe"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI Backend ──
+  backend:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://admin:senha123@db:5432/medical_scribe
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    env_file:
+      - ./backend/.env
+
+  # ── Angular Frontend (Nginx) ──
+  frontend:
+    build: ./frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
