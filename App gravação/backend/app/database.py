@@ -63,6 +63,7 @@ class ConsultationRecord(Base):
     iniciais: Mapped[str] = mapped_column(String(20), nullable=False)
     paciente_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     idade: Mapped[int] = mapped_column(Integer, nullable=False)
+    sexo: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     cenario_atendimento: Mapped[str] = mapped_column(String(30), nullable=False)
 
     # ── Clinical ──
@@ -83,6 +84,7 @@ class ConsultationRecord(Base):
     total_falas: Mapped[int] = mapped_column(Integer, default=0)
     falas_medico: Mapped[int] = mapped_column(Integer, default=0)
     falas_paciente: Mapped[int] = mapped_column(Integer, default=0)
+    duracao_consulta_segundos: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # ── Documents ──
     documents_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -130,4 +132,41 @@ class DocumentRecord(Base):
     validated: Mapped[bool] = mapped_column(Boolean, default=False)
     validated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     validated_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AuditTrailRecord(Base):
+    """Immutable audit trail aligned with SBIS-2 traceability requirements."""
+    __tablename__ = "audit_trail"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    actor_role: Mapped[str] = mapped_column(String(30), nullable=False)
+    action: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    resource_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    consultation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    previous_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    record_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class DigitalSignatureRecord(Base):
+    """Stores signature preparation metadata for ICP-Brasil (A1 .p12 / A3 token)."""
+    __tablename__ = "digital_signatures"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    consultation_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    document_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    document_hash_sha256: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    canonical_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    signature_standard: Mapped[str] = mapped_column(String(40), default="CMS")
+    certificate_type: Mapped[str] = mapped_column(String(20), default="ICP-Brasil")
+    certificate_hint: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    signed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(80), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

@@ -8,14 +8,26 @@ Replaces the original main.py as the Docker entrypoint (uvicorn app.main:app)
 from contextlib import asynccontextmanager
 import logging
 import os
+import json
+import base64
+import hashlib
+import hmac
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
-from app.database import get_db, init_db, ConsultationRecord, BIRecord
+from app.database import (
+    get_db,
+    init_db,
+    ConsultationRecord,
+    BIRecord,
+    AuditTrailRecord,
+    DigitalSignatureRecord,
+)
 from core.security import process_patient_input
 from services.soap_engine import process as soap_process
 from services.documents import generate_all
@@ -65,7 +77,10 @@ class AudioInput(BaseModel):
     text: str
     nome_completo: str = "Paciente Anônimo"
     idade: int = 0
+    sexo: str = "NaoInformado"
     cenario_atendimento: str = "PS"
+    consultation_started_at: datetime | None = None
+    consultation_finished_at: datetime | None = None
 
 
 class AnalyzeResponse(BaseModel):
@@ -112,6 +127,11 @@ async def analyze(input: AudioInput, db: AsyncSession = Depends(get_db)):
         patient_data = lgpd_result["data"]
         logger.info(f"LGPD ✅ {patient_data['iniciais']} ({patient_data['paciente_id']})")
 
+        duracao_consulta_segundos = None
+        if input.consultation_started_at and input.consultation_finished_at:
+            delta = int((input.consultation_finished_at - input.consultation_started_at).total_seconds())
+            duracao_consulta_segundos = max(delta, 0)
+
         # 2. SOAP Processing (local engine — same logic as soap-engine.js)
         result = soap_process(input.text)
 
@@ -132,6 +152,7 @@ async def analyze(input: AudioInput, db: AsyncSession = Depends(get_db)):
             iniciais=patient_data["iniciais"],
             paciente_id=patient_data["paciente_id"],
             idade=patient_data["idade"],
+            sexo=input.sexo,
             cenario_atendimento=patient_data["cenario_atendimento"],
             cid_principal_code=result["clinicalData"]["cid_principal"]["code"],
             cid_principal_desc=result["clinicalData"]["cid_principal"]["desc"],
@@ -144,6 +165,7 @@ async def analyze(input: AudioInput, db: AsyncSession = Depends(get_db)):
             total_falas=result["metadata"]["total_falas"],
             falas_medico=result["metadata"]["falas_medico"],
             falas_paciente=result["metadata"]["falas_paciente"],
+            duracao_consulta_segundos=duracao_consulta_segundos,
             documents_json=documents,
             texto_transcrito=input.text,
         )
@@ -164,6 +186,17 @@ async def analyze(input: AudioInput, db: AsyncSession = Depends(get_db)):
 
         await db.commit()
         await db.refresh(consultation)
+
+        await _log_audit(
+            db=db,
+            actor_id="system",
+            actor_role="engine",
+            action="CONSULTATION_CREATED",
+            resource_type="consultation",
+            resource_id=str(consultation.id),
+            consultation_id=consultation.id,
+            payload={"cid": result["clinicalData"]["cid_principal"]["code"]},
+        )
 
         logger.info(f"DB ✅ consultation_id={consultation.id}")
 
@@ -270,6 +303,243 @@ async def get_consultation(consultation_id: int, db: AsyncSession = Depends(get_
     }
 
 
+def _admin_secret() -> str:
+    return os.getenv("ADMIN_DASHBOARD_SECRET", "trocar-essa-senha-admin")
+
+
+def _issue_admin_token(username: str) -> str:
+    payload = {
+        "sub": username,
+        "role": "admin",
+        "iat": int(datetime.now(tz=timezone.utc).timestamp()),
+        "exp": int(datetime.now(tz=timezone.utc).timestamp()) + 8 * 3600,
+    }
+    data = json.dumps(payload, separators=(",", ":")).encode()
+    sig = hmac.new(_admin_secret().encode(), data, hashlib.sha256).hexdigest()
+    return f"{base64.urlsafe_b64encode(data).decode()}.{sig}"
+
+
+def _validate_admin_token(token: str) -> dict:
+    try:
+        encoded, sig = token.split(".")
+        data = base64.urlsafe_b64decode(encoded.encode())
+        expected_sig = hmac.new(_admin_secret().encode(), data, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            raise HTTPException(status_code=401, detail="Token admin inválido")
+
+        payload = json.loads(data.decode())
+        if payload.get("exp", 0) < int(datetime.now(tz=timezone.utc).timestamp()):
+            raise HTTPException(status_code=401, detail="Token admin expirado")
+        return payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Token admin inválido") from exc
+
+
+def _require_admin(request: Request) -> dict:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token obrigatório")
+    token = auth.split(" ", 1)[1]
+    return _validate_admin_token(token)
+
+
+async def _log_audit(
+    db: AsyncSession,
+    actor_id: str,
+    actor_role: str,
+    action: str,
+    resource_type: str,
+    resource_id: str,
+    consultation_id: int | None = None,
+    payload: dict | None = None,
+    request: Request | None = None,
+):
+    last = await db.execute(select(AuditTrailRecord).order_by(AuditTrailRecord.id.desc()).limit(1))
+    previous = last.scalar_one_or_none()
+    previous_hash = previous.record_hash if previous else "GENESIS"
+    created_at = datetime.utcnow().isoformat()
+    hash_input = f"{previous_hash}|{actor_id}|{action}|{resource_type}|{resource_id}|{created_at}|{json.dumps(payload or {}, sort_keys=True)}"
+    record_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+
+    rec = AuditTrailRecord(
+        actor_id=actor_id,
+        actor_role=actor_role,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        consultation_id=consultation_id,
+        ip_address=request.client.host if request and request.client else None,
+        user_agent=request.headers.get("user-agent") if request else None,
+        payload=payload,
+        previous_hash=previous_hash,
+        record_hash=record_hash,
+    )
+    db.add(rec)
+    await db.commit()
+
+
+class AdminLoginInput(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/v1/admin/login")
+async def admin_login(input: AdminLoginInput, db: AsyncSession = Depends(get_db)):
+    expected_user = os.getenv("ADMIN_DASHBOARD_USER", "admin")
+    expected_password = _admin_secret()
+    if input.username != expected_user or input.password != expected_password:
+        raise HTTPException(status_code=401, detail="Credenciais inválidas")
+
+    token = _issue_admin_token(input.username)
+    await _log_audit(
+        db=db,
+        actor_id=input.username,
+        actor_role="admin",
+        action="ADMIN_LOGIN",
+        resource_type="dashboard",
+        resource_id="bi",
+    )
+    return {"status": "success", "token": token}
+
+
+@app.get("/api/v1/admin/bi/stats")
+async def admin_bi_stats(request: Request, db: AsyncSession = Depends(get_db)):
+    admin = _require_admin(request)
+    consultations_result = await db.execute(select(ConsultationRecord))
+    consultations = consultations_result.scalars().all()
+
+    by_sexo = {}
+    by_age_band = {"0-17": 0, "18-39": 0, "40-59": 0, "60+": 0}
+    by_hour = {str(h): 0 for h in range(24)}
+    cid_counts = {}
+    total_duration = 0
+    duration_count = 0
+
+    for c in consultations:
+        sexo = c.sexo or "NaoInformado"
+        by_sexo[sexo] = by_sexo.get(sexo, 0) + 1
+        if c.idade <= 17:
+            by_age_band["0-17"] += 1
+        elif c.idade <= 39:
+            by_age_band["18-39"] += 1
+        elif c.idade <= 59:
+            by_age_band["40-59"] += 1
+        else:
+            by_age_band["60+"] += 1
+
+        if c.created_at:
+            by_hour[str(c.created_at.hour)] += 1
+        cid_counts[c.cid_principal_code] = cid_counts.get(c.cid_principal_code, 0) + 1
+        if c.duracao_consulta_segundos:
+            total_duration += c.duracao_consulta_segundos
+            duration_count += 1
+
+    peak_hour = max(by_hour.items(), key=lambda kv: kv[1])[0] if consultations else None
+    avg_duration = int(total_duration / duration_count) if duration_count else None
+
+    await _log_audit(
+        db=db,
+        actor_id=admin["sub"],
+        actor_role="admin",
+        action="ADMIN_VIEW_STATS",
+        resource_type="dashboard",
+        resource_id="bi-stats",
+    )
+
+    return {
+        "status": "success",
+        "kpis": {
+            "total_consultas": len(consultations),
+            "duracao_media_segundos": avg_duration,
+            "hora_pico": peak_hour,
+        },
+        "por_sexo": by_sexo,
+        "por_faixa_etaria": by_age_band,
+        "fluxo_horario": by_hour,
+        "top_cids": sorted(cid_counts.items(), key=lambda kv: kv[1], reverse=True)[:10],
+    }
+
+
+@app.get("/api/v1/admin/bi/export.csv")
+async def export_bi_csv(request: Request, db: AsyncSession = Depends(get_db)):
+    admin = _require_admin(request)
+    result = await db.execute(select(ConsultationRecord).order_by(ConsultationRecord.created_at.desc()))
+    records = result.scalars().all()
+    lines = [
+        "consultation_id,data_hora,sexo,idade,cenario,cid,gravidade,duracao_segundos"
+    ]
+    for r in records:
+        lines.append(
+            f"{r.id},{r.created_at.isoformat() if r.created_at else ''},{r.sexo or 'NaoInformado'},{r.idade},{r.cenario_atendimento},{r.cid_principal_code},{r.gravidade},{r.duracao_consulta_segundos or ''}"
+        )
+
+    await _log_audit(
+        db=db,
+        actor_id=admin["sub"],
+        actor_role="admin",
+        action="ADMIN_EXPORT_CSV",
+        resource_type="dashboard",
+        resource_id="bi-export",
+    )
+
+    return {
+        "status": "success",
+        "filename": f"bi_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
+        "content": "\n".join(lines),
+    }
+
+
+@app.post("/api/v1/consultations/{consultation_id}/signature/prepare")
+async def prepare_signature_payload(consultation_id: int, request: Request, db: AsyncSession = Depends(get_db)):
+    admin = _require_admin(request)
+    result = await db.execute(select(ConsultationRecord).where(ConsultationRecord.id == consultation_id))
+    consultation = result.scalar_one_or_none()
+    if not consultation:
+        raise HTTPException(status_code=404, detail="Consulta não encontrada")
+
+    payload = {
+        "consultation_id": consultation.id,
+        "patient_id": consultation.paciente_id,
+        "cid": consultation.cid_principal_code,
+        "soap": consultation.soap_json,
+        "created_at": consultation.created_at.isoformat() if consultation.created_at else None,
+    }
+    canonical_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    digest = hashlib.sha256(canonical_payload.encode()).hexdigest()
+
+    signature = DigitalSignatureRecord(
+        consultation_id=consultation.id,
+        document_type="soap_bundle",
+        document_hash_sha256=digest,
+        canonical_payload=payload,
+        certificate_hint="Preparado para token A3 ou arquivo A1 .p12",
+        created_by=admin["sub"],
+    )
+    db.add(signature)
+    await db.commit()
+
+    await _log_audit(
+        db=db,
+        actor_id=admin["sub"],
+        actor_role="admin",
+        action="SIGNATURE_PREPARED",
+        resource_type="consultation",
+        resource_id=str(consultation.id),
+        consultation_id=consultation.id,
+        payload={"digest": digest},
+    )
+
+    return {
+        "status": "success",
+        "signature_id": signature.id,
+        "hash_sha256": digest,
+        "signature_standard": "CMS detached",
+        "next_step": "Assinar hash com certificado ICP-Brasil A1 (.p12) ou A3 (token) em módulo HSM/PKCS#11.",
+    }
+
+
 # ══════════════════════════════════════════════════════════════
 # GET /api/v1/bi/stats — BI Dashboard stats
 # ══════════════════════════════════════════════════════════════
@@ -332,6 +602,38 @@ async def bi_stats(db: AsyncSession = Depends(get_db)):
 # ══════════════════════════════════════════════════════════════
 # Health Check
 # ══════════════════════════════════════════════════════════════
+
+
+
+@app.get("/api/v1/admin/backup/manifest")
+async def backup_manifest(request: Request, db: AsyncSession = Depends(get_db)):
+    admin = _require_admin(request)
+    total = (await db.execute(select(func.count(ConsultationRecord.id)))).scalar() or 0
+    last = (await db.execute(select(ConsultationRecord).order_by(ConsultationRecord.created_at.desc()).limit(1))).scalar_one_or_none()
+
+    manifest = {
+        "backup_scope": "postgres_medical_scribe",
+        "generated_at": datetime.utcnow().isoformat(),
+        "retention_policy": "Sem retenção de áudio bruto; somente dados estruturados mínimos.",
+        "total_consultations": total,
+        "last_consultation_at": last.created_at.isoformat() if last and last.created_at else None,
+        "runbook": [
+            "pg_dump --format=custom --no-owner --file=backup.dump $DATABASE_URL",
+            "gpg --encrypt --recipient equipe-seguranca@hospital.local backup.dump",
+            "Teste de restauração trimestral com pg_restore em ambiente isolado"
+        ]
+    }
+
+    await _log_audit(
+        db=db,
+        actor_id=admin["sub"],
+        actor_role="admin",
+        action="BACKUP_MANIFEST_VIEWED",
+        resource_type="backup",
+        resource_id="manifest",
+    )
+
+    return {"status": "success", "manifest": manifest}
 
 @app.get("/api/v1/health")
 async def health():

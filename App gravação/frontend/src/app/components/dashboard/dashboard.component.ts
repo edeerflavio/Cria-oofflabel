@@ -8,6 +8,7 @@
 
 import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
 import { BaseChartDirective } from 'ng2-charts';
 import { ChartConfiguration, ChartType } from 'chart.js';
 
@@ -41,10 +42,21 @@ interface CriticalRecord {
 @Component({
     selector: 'app-dashboard',
     standalone: true,
-    imports: [CommonModule, BaseChartDirective],
+    imports: [CommonModule, FormsModule, BaseChartDirective],
     template: `
     <!-- Empty State -->
-    <div class="bi-empty" *ngIf="records.length === 0 && !loading">
+    <div class="bi-empty" *ngIf="!adminToken && !loading">
+      <div class="bi-empty-icon">🔐</div>
+      <h3>Dashboard administrativo</h3>
+      <p>Informe usuário e senha para liberar estatísticas e exportação.</p>
+      <div style="max-width:320px;margin:0 auto;display:grid;gap:8px">
+        <input placeholder="Usuário" [(ngModel)]="adminUser" />
+        <input placeholder="Senha" [(ngModel)]="adminPassword" type="password" />
+        <button class="btn btn-secondary" (click)="loginAdmin()">Entrar</button>
+      </div>
+    </div>
+
+    <div class="bi-empty" *ngIf="records.length === 0 && adminToken && !loading">
       <div class="bi-empty-icon">📊</div>
       <h3>Nenhum dado ainda</h3>
       <p>Os dashboards serão populados após o primeiro ciclo de atendimento.</p>
@@ -92,6 +104,10 @@ interface CriticalRecord {
           </div>
           <div class="bi-stat-label">FC Média bpm (PS | UTI)</div>
         </div>
+      </div>
+
+      <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
+        <button class="btn btn-secondary" (click)="exportCsv()">Exportar CSV</button>
       </div>
 
       <!-- Critical Vitals Alert -->
@@ -301,6 +317,9 @@ export class DashboardComponent implements OnInit {
 
     records: BIRecord[] = [];
     loading = false;
+    adminUser = 'admin';
+    adminPassword = '';
+    adminToken = '';
 
     // Derived stats
     gravesCount = 0;
@@ -360,8 +379,54 @@ export class DashboardComponent implements OnInit {
     };
 
     ngOnInit(): void {
-        // Records would be loaded from a service in production
-        // For now, component expects records to be set externally or via loadDemoData()
+        // Dashboard protegido por credenciais administrativas
+    }
+
+    loginAdmin(): void {
+        this.loading = true;
+        fetch('/api/v1/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: this.adminUser, password: this.adminPassword }),
+        })
+            .then(r => {
+                if (!r.ok) throw new Error('Login falhou');
+                return r.json();
+            })
+            .then(data => {
+                this.adminToken = data.token;
+                return this.loadRecords();
+            })
+            .catch(() => this.loadDemoData())
+            .finally(() => {
+                this.loading = false;
+            });
+    }
+
+    private loadRecords(): Promise<void> {
+        return fetch('/api/v1/bi/stats')
+            .then(r => r.json())
+            .then(data => {
+                this.records = data.records || [];
+                this.processRecords();
+            });
+    }
+
+    exportCsv(): void {
+        if (!this.adminToken) return;
+        fetch('/api/v1/admin/bi/export.csv', {
+            headers: { Authorization: `Bearer ${this.adminToken}` },
+        })
+            .then(r => r.json())
+            .then(data => {
+                const blob = new Blob([data.content || ''], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = data.filename || 'dashboard-export.csv';
+                link.click();
+                URL.revokeObjectURL(url);
+            });
     }
 
     /**
