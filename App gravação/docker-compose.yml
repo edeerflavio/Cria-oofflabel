@@ -9,18 +9,18 @@ services:
 
   # ── PostgreSQL ──
   db:
-    image: postgres:16-alpine
+    image: postgres:16
     restart: unless-stopped
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: senha123
-      POSTGRES_DB: medical_scribe
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-senha123}
+      POSTGRES_DB: ${POSTGRES_DB:-medical_scribe}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d medical_scribe"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-medical_scribe}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -37,8 +37,9 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+asyncpg://admin:senha123@db:5432/medical_scribe
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://admin:senha123@db:5432/medical_scribe}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://localhost:80}
     env_file:
       - ./backend/.env
 

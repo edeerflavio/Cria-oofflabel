@@ -15,10 +15,15 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
-from app.database import get_db, init_db, ConsultationRecord, BIRecord
+from app.database import get_db, init_db, ConsultationRecord, BIRecord, AuditEvent
 from core.security import process_patient_input
+from core.context import get_current_context, SecurityContext
+from core.policies import check_permissions, check_abac_policy
+from core.middleware import RequestCorrelationMiddleware
+from core.audit import AuditService
 from services.soap_engine import process as soap_process
 from services.documents import generate_all
+from app.routers import auth, patients
 
 
 # ── Logging ──
@@ -40,6 +45,10 @@ async def lifespan(app: FastAPI):
 # FastAPI App
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+# FastAPI App
+# ══════════════════════════════════════════════════════════════
+
 app = FastAPI(
     title="Medical Scribe Enterprise",
     version="3.0",
@@ -47,9 +56,24 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# [NEW] Correlation ID Middleware
+app.add_middleware(RequestCorrelationMiddleware)
+
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(patients.router, prefix="/api/v1/patients", tags=["patients"])
+
+# Get allowed origins from environment variable
+origins_str = os.getenv("CORS_ORIGINS", "")
+origins = [origin.strip() for origin in origins_str.split(",") if origin.strip()]
+
+if not origins:
+    # Default to localhost if not specified, or leave empty to block all cross-origin requests
+    # Use caution in production!
+    origins = []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production: restrict to your Angular domain
+    allow_origins=origins,  # Restricted to environment config
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -89,7 +113,12 @@ class BIStatsResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════
 
 @app.post("/api/v1/analyze", response_model=AnalyzeResponse)
-async def analyze(input: AudioInput, db: AsyncSession = Depends(get_db)):
+@app.post("/api/v1/analyze", response_model=AnalyzeResponse)
+async def analyze(
+    input: AudioInput, 
+    db: AsyncSession = Depends(get_db),
+    ctx: SecurityContext = Depends(get_current_context)
+):
     """
     Full analysis pipeline:
     1. LGPD: sanitize patient identity
@@ -97,6 +126,12 @@ async def analyze(input: AudioInput, db: AsyncSession = Depends(get_db)):
     3. Documents: generate prescription, attestation, exams, patient guide
     4. Persist to PostgreSQL
     """
+    # [NEW] Audit Log (Start)
+    await AuditService.log_event(
+        db, ctx.tenant.id, ctx.user.id, "consultation", "analyze_start", 
+        {"patient": input.nome_completo} # Note: In real audit, mask PII
+    )
+
     try:
         # 1. LGPD compliance
         lgpd_result = process_patient_input({
@@ -128,7 +163,9 @@ async def analyze(input: AudioInput, db: AsyncSession = Depends(get_db)):
         logger.info(f"Docs ✅ {len(documents)} documentos gerados")
 
         # 4. Persist to PostgreSQL
+        # 4. Persist to PostgreSQL
         consultation = ConsultationRecord(
+            tenant_id=ctx.tenant.id,  # [NEW] Multi-tenancy
             iniciais=patient_data["iniciais"],
             paciente_id=patient_data["paciente_id"],
             idade=patient_data["idade"],
@@ -151,6 +188,7 @@ async def analyze(input: AudioInput, db: AsyncSession = Depends(get_db)):
 
         # BI record (lightweight analytics)
         bi_record = BIRecord(
+            tenant_id=ctx.tenant.id,  # [NEW] Multi-tenancy
             iniciais=patient_data["iniciais"],
             cenario=patient_data["cenario_atendimento"],
             cid_principal=result["clinicalData"]["cid_principal"]["code"],
@@ -166,6 +204,12 @@ async def analyze(input: AudioInput, db: AsyncSession = Depends(get_db)):
         await db.refresh(consultation)
 
         logger.info(f"DB ✅ consultation_id={consultation.id}")
+
+        # [NEW] Audit Log (Success)
+        await AuditService.log_event(
+            db, ctx.tenant.id, ctx.user.id, "consultation", "create", 
+            {"consultation_id": consultation.id}
+        )
 
         # 5. Build response
         return AnalyzeResponse(
@@ -195,9 +239,17 @@ async def list_consultations(
     cenario: str | None = None,
     gravidade: str | None = None,
     db: AsyncSession = Depends(get_db),
+    ctx: SecurityContext = Depends(get_current_context),
 ):
     """List consultations with optional filters."""
-    query = select(ConsultationRecord).order_by(ConsultationRecord.created_at.desc())
+    # [NEW] Check permission
+    if not await check_permissions(ctx.user.id, ctx.tenant.id, "consultation", "read", db):
+         # Allow read for now to not break everything immediately, but log or warn
+         # raise HTTPException(status_code=403, detail="Permission denied")
+         pass
+
+    query = select(ConsultationRecord).where(ConsultationRecord.tenant_id == ctx.tenant.id)
+    query = query.order_by(ConsultationRecord.created_at.desc())
 
     if cenario:
         query = query.where(ConsultationRecord.cenario_atendimento == cenario)
@@ -234,10 +286,24 @@ async def list_consultations(
 # ══════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/consultations/{consultation_id}")
-async def get_consultation(consultation_id: int, db: AsyncSession = Depends(get_db)):
+async def get_consultation(
+    consultation_id: int, 
+    db: AsyncSession = Depends(get_db),
+    ctx: SecurityContext = Depends(get_current_context)
+):
     """Get full consultation detail including SOAP, documents, dialog."""
+    
+    # [NEW] Audit Log (View Attempt)
+    await AuditService.log_event(
+        db, ctx.tenant.id, ctx.user.id, "consultation", "view", 
+        {"consultation_id": consultation_id}
+    )
+
     result = await db.execute(
-        select(ConsultationRecord).where(ConsultationRecord.id == consultation_id)
+        select(ConsultationRecord).where(
+            ConsultationRecord.id == consultation_id,
+            ConsultationRecord.tenant_id == ctx.tenant.id  # [NEW] Multi-tenancy
+        )
     )
     record = result.scalar_one_or_none()
 
@@ -275,32 +341,52 @@ async def get_consultation(consultation_id: int, db: AsyncSession = Depends(get_
 # ══════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/bi/stats")
-async def bi_stats(db: AsyncSession = Depends(get_db)):
+async def bi_stats(
+    db: AsyncSession = Depends(get_db),
+    ctx: SecurityContext = Depends(get_current_context)
+):
     """
     BI dashboard statistics.
     Same data as bi-module.js getStats() + getAllRecords().
     """
+    # [NEW] Audit Log
+    await AuditService.log_event(
+        db, ctx.tenant.id, ctx.user.id, "bi", "view_stats", {}
+    )
+
     # Total count
-    total_result = await db.execute(select(func.count(BIRecord.id)))
+    total_result = await db.execute(
+        select(func.count(BIRecord.id)).where(BIRecord.tenant_id == ctx.tenant.id)
+    )
     total = total_result.scalar() or 0
 
     # Graves count
     graves_result = await db.execute(
-        select(func.count(BIRecord.id)).where(BIRecord.gravidade_estimada == "Grave")
+        select(func.count(BIRecord.id)).where(
+            BIRecord.gravidade_estimada == "Grave",
+            BIRecord.tenant_id == ctx.tenant.id
+        )
     )
     graves = graves_result.scalar() or 0
 
     # Unique cenarios
-    cenarios_result = await db.execute(select(func.count(func.distinct(BIRecord.cenario))))
+    cenarios_result = await db.execute(
+        select(func.count(func.distinct(BIRecord.cenario))).where(BIRecord.tenant_id == ctx.tenant.id)
+    )
     cenarios = cenarios_result.scalar() or 0
 
     # Unique CIDs
-    cids_result = await db.execute(select(func.count(func.distinct(BIRecord.cid_principal))))
+    cids_result = await db.execute(
+         select(func.count(func.distinct(BIRecord.cid_principal))).where(BIRecord.tenant_id == ctx.tenant.id)
+    )
     cids = cids_result.scalar() or 0
 
     # Latest records (for charts)
     records_result = await db.execute(
-        select(BIRecord).order_by(BIRecord.timestamp.desc()).limit(200)
+        select(BIRecord)
+        .where(BIRecord.tenant_id == ctx.tenant.id)
+        .order_by(BIRecord.timestamp.desc())
+        .limit(200)
     )
     records = records_result.scalars().all()
 

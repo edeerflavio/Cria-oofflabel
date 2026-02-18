@@ -6,8 +6,10 @@
 # Stage 1: Build Angular app
 FROM node:20-alpine AS build
 WORKDIR /app
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+ENV NG_CLI_ANALYTICS="false"
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --legacy-peer-deps
 COPY . .
 RUN npm run build -- --configuration=production
 
