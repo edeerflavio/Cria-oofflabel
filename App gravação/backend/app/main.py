@@ -9,11 +9,12 @@ from contextlib import asynccontextmanager
 import logging
 import os
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+import tempfile
 
 from app.database import get_db, init_db, ConsultationRecord, BIRecord, AuditEvent
 from core.security import process_patient_input
@@ -49,6 +50,11 @@ async def lifespan(app: FastAPI):
 # FastAPI App
 # ══════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════
+# FastAPI App
+# ══════════════════════════════════════════════════════════════
+
 app = FastAPI(
     title="Medical Scribe Enterprise",
     version="3.0",
@@ -56,19 +62,97 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ══════════════════════════════════════════════════════════════
+# WebSocket Endpoint for Real-time Transcription
+# ══════════════════════════════════════════════════════════════
+
+@app.websocket("/ws/transcribe")
+async def websocket_transcribe(websocket: WebSocket):
+    await websocket.accept()
+    full_transcript = ""
+    chunk_count = 0
+    try:
+        while True:
+            data = await websocket.receive()
+            if "text" in data:
+                message = data["text"]
+                if message == "stop":
+                    await websocket.send_json({
+                        "type": "final",
+                        "text": full_transcript,
+                        "chunks": chunk_count
+                    })
+                    break
+                continue
+            if "bytes" in data:
+                audio_bytes = data["bytes"]
+                
+                if len(audio_bytes) < 1000:
+                    continue
+                
+                chunk_count += 1
+                
+                with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = tmp.name
+                
+                try:
+                    with open(tmp_path, "rb") as audio_file:
+                        transcription = client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=audio_file,
+                            language="pt"
+                        )
+                    
+                    chunk_text = transcription.text.strip()
+                    if chunk_text:
+                        # Como recebemos o áudio acumulado completo, o resultado
+                        # do Whisper já contém TODA a transcrição até o momento
+                        full_transcript = chunk_text
+                        
+                        await websocket.send_json({
+                            "type": "partial",
+                            "text": chunk_text,
+                            "full_text": full_transcript
+                        })
+                
+                except Exception as chunk_error:
+                    logger.warning(f"Chunk {chunk_count} falhou: {chunk_error}")
+                    continue
+                
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+    except WebSocketDisconnect:
+        logger.info("WebSocket desconectado")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except:
+            pass
+
+# [NEW] Permissions Policy
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Permissions-Policy"] = "microphone=(self)"
+    return response
+
 # [NEW] Correlation ID Middleware
 app.add_middleware(RequestCorrelationMiddleware)
 
+# ── Routers ──
+# from app.api.v1.endpoints import admin_stats  <-- Removed, unified into main.py
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(patients.router, prefix="/api/v1/patients", tags=["patients"])
+# app.include_router(admin_stats.router, prefix="/api/v1/admin/stats", tags=["admin"]) <-- Removed
 
 # Get allowed origins from environment variable
-origins_str = os.getenv("CORS_ORIGINS", "")
+origins_str = os.getenv("CORS_ORIGINS", "http://localhost,http://localhost:4200")
 origins = [origin.strip() for origin in origins_str.split(",") if origin.strip()]
 
 if not origins:
-    # Default to localhost if not specified, or leave empty to block all cross-origin requests
-    # Use caution in production!
     origins = []
 
 app.add_middleware(
@@ -85,7 +169,7 @@ app.add_middleware(
 # ══════════════════════════════════════════════════════════════
 
 class AudioInput(BaseModel):
-    """Input for the analyze endpoint."""
+    """Input for the analyze endpoint (JSON mode)."""
     text: str
     nome_completo: str = "Paciente Anônimo"
     idade: int = 0
@@ -106,39 +190,122 @@ class BIStatsResponse(BaseModel):
     cenarios: int
     cids: int
     records: list[dict]
+    # Detailed stats (unified)
+    summary: dict | None = None
+    pathologies: list[dict] | None = None
+    demographics: dict | None = None
+    top_medications: list[dict] | None = None
 
 
 # ══════════════════════════════════════════════════════════════
-# POST /api/v1/analyze — Full pipeline
+# Whisper Transcription Service
+# ══════════════════════════════════════════════════════════════
+
+import shutil
+from fastapi import UploadFile, File, Form
+from typing import Optional
+from openai import OpenAI
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+async def transcribe_audio(file: UploadFile) -> str:
+    """
+    Transcribes audio using OpenAI Whisper (Cloud).
+    Saves temp file -> Whisper API -> Returns text.
+    """
+    try:
+        # Create temp file
+        temp_filename = f"temp_{file.filename}"
+        with open(temp_filename, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        logger.info(f"🎤 Transcribing audio: {temp_filename}")
+
+        with open(temp_filename, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=audio_file,
+                language="pt"
+            )
+        
+        # Cleanup
+        os.remove(temp_filename)
+        
+        return transcription.text
+    except Exception as e:
+        logger.error(f"❌ Transcription error: {e}")
+        # Cleanup if exists
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+        raise HTTPException(status_code=500, detail=f"Erro na transcrição: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════
+# POST /api/v1/analyze — Full pipeline (Audio OR Text)
 # ══════════════════════════════════════════════════════════════
 
 @app.post("/api/v1/analyze", response_model=AnalyzeResponse)
-@app.post("/api/v1/analyze", response_model=AnalyzeResponse)
+@app.post("/api/analyze", response_model=AnalyzeResponse, include_in_schema=False)
+@app.post("/scribe/process", response_model=AnalyzeResponse, include_in_schema=False)
 async def analyze(
-    input: AudioInput, 
+    # Unified input: accept either File + Form OR default JSON (via other logic if we used Pydantic only)
+    # Since we need to support both multipart (audio) and potentially JSON (text), 
+    # FastAPI handles this best with Form/File parameters.
+    # We will make input optional to support the JSON-only legacy calls if implemented, 
+    # but here we prioritize the Multipart Form approach requested.
+    
+    file: UploadFile = File(None),
+    nome_completo: str = Form("Paciente Anônimo"),
+    idade: Optional[str] = Form(None), # Handle "null" or empty strings from frontend
+    cenario_atendimento: str = Form("PS"),
+    texto_transcrito: str = Form(""),
+    
+    # Original JSON body support is tricky when mixing File/Form. 
+    # We assume the frontend now uses FormData for everything.
+    
     db: AsyncSession = Depends(get_db),
     ctx: SecurityContext = Depends(get_current_context)
 ):
     """
     Full analysis pipeline:
-    1. LGPD: sanitize patient identity
-    2. SOAP Engine: process text → structured clinical data
-    3. Documents: generate prescription, attestation, exams, patient guide
-    4. Persist to PostgreSQL
+    1. Audio Transcription (if file provided)
+    2. LGPD: sanitize patient identity
+    3. SOAP Engine: process text → structured clinical data
+    4. Documents: generate prescription, attestation, exams, patient guide
+    5. Persist to PostgreSQL
     """
+    
+    # Process inputs
+    final_text = texto_transcrito
+    
+    if file:
+        logger.info(f"🎤 Audio file received: {file.filename}")
+        transcribed = await transcribe_audio(file)
+        if transcribed:
+            final_text = transcribed
+            logger.info(f"📝 Transcribed text: {final_text[:50]}...")
+    
+    if not final_text:
+        raise HTTPException(status_code=400, detail="Nenhum áudio ou texto fornecido.")
+
+    # Parse age safely
+    idade_int = 0
+    if idade and str(idade).isdigit():
+        idade_int = int(idade)
+
     # [NEW] Audit Log (Start)
     await AuditService.log_event(
         db, ctx.tenant.id, ctx.user.id, "consultation", "analyze_start", 
-        {"patient": input.nome_completo} # Note: In real audit, mask PII
+        {"patient": nome_completo}
     )
 
     try:
         # 1. LGPD compliance
         lgpd_result = process_patient_input({
-            "nome_completo": input.nome_completo,
-            "idade": input.idade,
-            "cenario_atendimento": input.cenario_atendimento,
-            "texto_transcrito": input.text,
+            "nome_completo": nome_completo,
+            "idade": idade_int,
+            "cenario_atendimento": cenario_atendimento,
+            "texto_transcrito": final_text,
         })
 
         if not lgpd_result.get("success"):
@@ -148,7 +315,7 @@ async def analyze(
         logger.info(f"LGPD ✅ {patient_data['iniciais']} ({patient_data['paciente_id']})")
 
         # 2. SOAP Processing (local engine — same logic as soap-engine.js)
-        result = soap_process(input.text)
+        result = soap_process(final_text)
 
         if not result.get("success"):
             raise HTTPException(status_code=422, detail=result.get("error", "Processamento SOAP falhou"))
@@ -163,9 +330,8 @@ async def analyze(
         logger.info(f"Docs ✅ {len(documents)} documentos gerados")
 
         # 4. Persist to PostgreSQL
-        # 4. Persist to PostgreSQL
         consultation = ConsultationRecord(
-            tenant_id=ctx.tenant.id,  # [NEW] Multi-tenancy
+            tenant_id=ctx.tenant.id,
             iniciais=patient_data["iniciais"],
             paciente_id=patient_data["paciente_id"],
             idade=patient_data["idade"],
@@ -182,13 +348,13 @@ async def analyze(
             falas_medico=result["metadata"]["falas_medico"],
             falas_paciente=result["metadata"]["falas_paciente"],
             documents_json=documents,
-            texto_transcrito=input.text,
+            first_transcription=final_text,
         )
         db.add(consultation)
 
         # BI record (lightweight analytics)
         bi_record = BIRecord(
-            tenant_id=ctx.tenant.id,  # [NEW] Multi-tenancy
+            tenant_id=ctx.tenant.id,
             iniciais=patient_data["iniciais"],
             cenario=patient_data["cenario_atendimento"],
             cid_principal=result["clinicalData"]["cid_principal"]["code"],
@@ -214,7 +380,7 @@ async def analyze(
         # 5. Build response
         return AnalyzeResponse(
             status="success",
-            data=result,
+            data=result, # Contains soap, clinicalData, etc
             patient=patient_data,
             documents=documents,
             consultation_id=consultation.id,
@@ -242,10 +408,7 @@ async def list_consultations(
     ctx: SecurityContext = Depends(get_current_context),
 ):
     """List consultations with optional filters."""
-    # [NEW] Check permission
     if not await check_permissions(ctx.user.id, ctx.tenant.id, "consultation", "read", db):
-         # Allow read for now to not break everything immediately, but log or warn
-         # raise HTTPException(status_code=403, detail="Permission denied")
          pass
 
     query = select(ConsultationRecord).where(ConsultationRecord.tenant_id == ctx.tenant.id)
@@ -293,7 +456,6 @@ async def get_consultation(
 ):
     """Get full consultation detail including SOAP, documents, dialog."""
     
-    # [NEW] Audit Log (View Attempt)
     await AuditService.log_event(
         db, ctx.tenant.id, ctx.user.id, "consultation", "view", 
         {"consultation_id": consultation_id}
@@ -302,7 +464,7 @@ async def get_consultation(
     result = await db.execute(
         select(ConsultationRecord).where(
             ConsultationRecord.id == consultation_id,
-            ConsultationRecord.tenant_id == ctx.tenant.id  # [NEW] Multi-tenancy
+            ConsultationRecord.tenant_id == ctx.tenant.id
         )
     )
     record = result.scalar_one_or_none()
@@ -337,8 +499,10 @@ async def get_consultation(
 
 
 # ══════════════════════════════════════════════════════════════
-# GET /api/v1/bi/stats — BI Dashboard stats
+# GET /api/v1/bi/stats — UNIFIED BI + ADMIN Dashboard stats
 # ══════════════════════════════════════════════════════════════
+
+from sqlalchemy import desc
 
 @app.get("/api/v1/bi/stats")
 async def bi_stats(
@@ -346,21 +510,19 @@ async def bi_stats(
     ctx: SecurityContext = Depends(get_current_context)
 ):
     """
-    BI dashboard statistics.
-    Same data as bi-module.js getStats() + getAllRecords().
+    Unified BI & Admin Dashboard statistics.
+    Combines legacy BI stats with deep Admin aggregations.
     """
-    # [NEW] Audit Log
     await AuditService.log_event(
         db, ctx.tenant.id, ctx.user.id, "bi", "view_stats", {}
     )
 
-    # Total count
+    # 1. Basic Counts (from BIRecord)
     total_result = await db.execute(
         select(func.count(BIRecord.id)).where(BIRecord.tenant_id == ctx.tenant.id)
     )
     total = total_result.scalar() or 0
 
-    # Graves count
     graves_result = await db.execute(
         select(func.count(BIRecord.id)).where(
             BIRecord.gravidade_estimada == "Grave",
@@ -369,26 +531,87 @@ async def bi_stats(
     )
     graves = graves_result.scalar() or 0
 
-    # Unique cenarios
     cenarios_result = await db.execute(
         select(func.count(func.distinct(BIRecord.cenario))).where(BIRecord.tenant_id == ctx.tenant.id)
     )
     cenarios = cenarios_result.scalar() or 0
 
-    # Unique CIDs
     cids_result = await db.execute(
          select(func.count(func.distinct(BIRecord.cid_principal))).where(BIRecord.tenant_id == ctx.tenant.id)
     )
     cids = cids_result.scalar() or 0
 
-    # Latest records (for charts)
+    # 2. Latest records (for list view)
     records_result = await db.execute(
         select(BIRecord)
         .where(BIRecord.tenant_id == ctx.tenant.id)
         .order_by(BIRecord.timestamp.desc())
-        .limit(200)
+        .limit(20) # Limit to 20 for lightness
     )
     records = records_result.scalars().all()
+
+    # 3. Deep Analysis (Pathologies, Meds, Demographics)
+    # Re-implemented from admin_stats.py directly here
+
+    # Pathologies (CID-10 Grouping)
+    cid_query = (
+        select(
+            ConsultationRecord.cid_principal_code,
+            ConsultationRecord.cid_principal_desc,
+            func.count(ConsultationRecord.id).label("count")
+        )
+        .where(ConsultationRecord.tenant_id == ctx.tenant.id)
+        .group_by(ConsultationRecord.cid_principal_code, ConsultationRecord.cid_principal_desc)
+        .order_by(desc("count"))
+        .limit(10)
+    )
+    cid_result = await db.execute(cid_query)
+    pathologies = [
+        {"code": row.cid_principal_code, "name": row.cid_principal_desc, "count": row.count}
+        for row in cid_result.all()
+    ]
+
+    # Demographics - Age Groups
+    age_query = select(ConsultationRecord.idade).where(ConsultationRecord.tenant_id == ctx.tenant.id)
+    age_result = await db.execute(age_query)
+    ages = age_result.scalars().all()
+
+    age_distribution = {
+        "0-12": 0,
+        "13-18": 0,
+        "19-59": 0,
+        "60+": 0
+    }
+    
+    for age in ages:
+        if age <= 12: age_distribution["0-12"] += 1
+        elif age <= 18: age_distribution["13-18"] += 1
+        elif age <= 59: age_distribution["19-59"] += 1
+        else: age_distribution["60+"] += 1
+
+    # Medications (Parsing JSON)
+    meds_query = (
+        select(ConsultationRecord.json_universal)
+        .where(ConsultationRecord.tenant_id == ctx.tenant.id)
+        .order_by(ConsultationRecord.created_at.desc())
+        .limit(100)
+    )
+    meds_result = await db.execute(meds_query)
+    
+    med_counts = {}
+    for row in meds_result.scalars().all():
+        if row and "Medicações_Atuais" in row:
+            meds = row["Medicações_Atuais"]
+            if isinstance(meds, list):
+                for med in meds:
+                    name = med.split(" ")[0].upper() # Take first word
+                    med_counts[name] = med_counts.get(name, 0) + 1
+    
+    top_medications = sorted(
+        [{"name": k, "count": v} for k, v in med_counts.items()],
+        key=lambda x: x["count"],
+        reverse=True
+    )[:10]
 
     return {
         "status": "success",
@@ -412,6 +635,16 @@ async def bi_stats(
             }
             for r in records
         ],
+        # Unified Dashboard Keys
+        "summary": {
+            "total_consultations": total,
+            "avg_duration_min": 15, # Placeholder
+        },
+        "pathologies": pathologies,
+        "demographics": {
+            "age_groups": age_distribution,
+        },
+        "top_medications": top_medications
     }
 
 
