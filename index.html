@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description"
+        content="Medical Scribe — Sistema de documentação clínica automatizada com BI hospitalar. LGPD compliant.">
+    <title>Medical Scribe — Documentação Clínica Inteligente</title>
+
+    <!-- Styles -->
+    <link rel="stylesheet" href="./styles.css">
+
+    <!-- CDN Dependencies -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+</head>
+
+<body>
+
+    <!-- ════════════════ NAVBAR ════════════════ -->
+    <nav class="navbar">
+        <a href="#" class="nav-logo">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+            </svg>
+            Medical Scribe
+        </a>
+
+        <div class="nav-links">
+            <button class="nav-link active" data-nav="gravacao">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                    <line x1="12" y1="19" x2="12" y2="23" />
+                    <line x1="8" y1="23" x2="16" y2="23" />
+                </svg>
+                Gravação
+            </button>
+            <button class="nav-link" data-nav="revisao">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                    <polyline points="14 2 14 8 20 8" />
+                    <line x1="16" y1="13" x2="8" y2="13" />
+                    <line x1="16" y1="17" x2="8" y2="17" />
+                </svg>
+                Revisão SOAP
+            </button>
+            <button class="nav-link" data-nav="documentos">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+                    <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
+                </svg>
+                Documentos
+            </button>
+            <button class="nav-link" data-nav="dashboard">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="18" y1="20" x2="18" y2="10" />
+                    <line x1="12" y1="20" x2="12" y2="4" />
+                    <line x1="6" y1="20" x2="6" y2="14" />
+                </svg>
+                Dashboard BI
+                <span class="nav-badge" id="biBadge" style="display:none;">0</span>
+            </button>
+        </div>
+
+        <div class="nav-right">
+            <span id="lgpdStatus"></span>
+        </div>
+    </nav>
+
+    <!-- ════════════════ MAIN CONTENT ════════════════ -->
+    <main class="main-content">
+
+        <!-- ── Section: Gravação ── -->
+        <div class="section active" id="section-gravacao">
+            <div class="record-hero">
+                <h2>Nova Consulta</h2>
+                <p>Grave a conversa ou digite manualmente. Os dados serão processados automaticamente.</p>
+            </div>
+
+            <div class="record-button-wrap">
+                <div class="record-ring" id="recordRing"></div>
+                <button class="record-btn" id="btnRecord" type="button">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                        <line x1="12" y1="19" x2="12" y2="23" />
+                        <line x1="8" y1="23" x2="16" y2="23" />
+                    </svg>
+                    Gravar
+                </button>
+            </div>
+            <p class="record-status" id="recordStatus">Clique para iniciar a gravação</p>
+            <p id="speechLabel"
+                style="text-align:center; font-size:0.82rem; color: var(--text-muted); margin-top: 4px;"></p>
+
+            <!-- Patient Form -->
+            <div class="patient-form-card">
+                <div class="form-title">
+                    🧑‍⚕️ Dados do Atendimento
+                </div>
+                <form id="patientForm">
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label for="inputNome">Nome Completo do Paciente</label>
+                            <input type="text" id="inputNome" class="form-input"
+                                placeholder="Ex: Maria Aparecida Santos" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="inputIdade">Idade</label>
+                            <input type="number" id="inputIdade" class="form-input" placeholder="Ex: 54" min="0"
+                                max="150" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="selectCenario">Cenário</label>
+                            <select id="selectCenario" class="form-select" required>
+                                <option value="">Selecione...</option>
+                                <option value="UBS">🏥 UBS</option>
+                                <option value="PS">🚑 Pronto Socorro</option>
+                                <option value="UTI">🏨 UTI</option>
+                                <option value="Consultório">🩺 Consultório</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Live Transcript -->
+                    <div class="transcript-area">
+                        <h5>📝 Transcrição em Tempo Real</h5>
+                        <div id="liveTranscript">
+                            <span class="placeholder-text">A transcrição aparecerá aqui ao iniciar a gravação...</span>
+                        </div>
+                    </div>
+
+                    <!-- Manual Text Fallback -->
+                    <div class="manual-fallback" id="manualFallback">
+                        <textarea id="manualText" class="manual-textarea"
+                            placeholder="Ou digite/cole o texto da consulta aqui...&#10;&#10;Ex: Paciente refere dor de cabeça intensa há 3 dias. Tomo losartana 50mg. Tenho alergia a dipirona. PA 160x100mmHg."></textarea>
+                        <div class="manual-actions">
+                            <button type="button" class="btn btn-secondary btn-sm" id="btnSendManual">📝 Adicionar
+                                Texto</button>
+                            <button type="button" class="btn btn-secondary btn-sm" id="btnUseExample">📋 Usar
+                                Exemplo</button>
+                        </div>
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary btn-block">
+                            🧠 Processar Consulta
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- ── Section: Revisão SOAP ── -->
+        <div class="section" id="section-revisao">
+            <div class="section-header">
+                <h2>📋 Revisão SOAP</h2>
+                <div style="display:flex; gap:10px;">
+                    <button class="btn btn-secondary" onclick="App.navigateTo('documentos')">Ver Documentos →</button>
+                    <button class="btn btn-new" onclick="App.newConsultation()">+ Nova Consulta</button>
+                </div>
+            </div>
+            <div id="soapCards">
+                <div class="bi-empty" style="padding: 80px 20px;">
+                    <div class="bi-empty-icon">📋</div>
+                    <h3>Nenhuma consulta processada</h3>
+                    <p>Grave ou digite uma consulta na aba de Gravação para ver a revisão SOAP aqui.</p>
+                    <button class="btn btn-primary" onclick="App.navigateTo('gravacao')" style="margin-top: 16px;">
+                        Ir para Gravação
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── Section: Documentos ── -->
+        <div class="section" id="section-documentos">
+            <div class="section-header">
+                <h2>📝 Documentos Clínicos</h2>
+                <div style="display:flex; gap:10px;">
+                    <button class="btn btn-secondary" onclick="App.navigateTo('dashboard')">Ver Dashboard →</button>
+                    <button class="btn btn-new" onclick="App.newConsultation()">+ Nova Consulta</button>
+                </div>
+            </div>
+            <div id="docsContainer">
+                <div class="bi-empty" style="padding: 80px 20px;">
+                    <div class="bi-empty-icon">📝</div>
+                    <h3>Nenhum documento gerado</h3>
+                    <p>Processe uma consulta para gerar receituário, atestado, pedido de exames e guia para o paciente.
+                    </p>
+                    <button class="btn btn-primary" onclick="App.navigateTo('gravacao')" style="margin-top: 16px;">
+                        Ir para Gravação
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── Section: Dashboard BI ── -->
+        <div class="section" id="section-dashboard">
+            <div class="section-header">
+                <h2>📊 Dashboard de Gestão Hospitalar</h2>
+                <button class="btn btn-new" onclick="App.newConsultation()">+ Nova Consulta</button>
+            </div>
+            <div id="biContainer"></div>
+        </div>
+
+    </main>
+
+    <!-- ════════════════ OVERLAYS & MODALS ════════════════ -->
+
+    <!-- Processing Overlay -->
+    <div class="processing-overlay" id="processingOverlay">
+        <div class="processing-spinner"></div>
+        <div class="processing-text">Processando consulta...</div>
+        <div class="processing-sub">Diarização → SOAP → Documentos → BI</div>
+    </div>
+
+    <!-- Validation Modal -->
+    <div class="modal-overlay" id="validateModal">
+        <div class="modal-card">
+            <div class="modal-icon">🔒</div>
+            <h3>Validação do Médico Assistente</h3>
+            <p>Ao validar, você confirma que revisou este documento e que as informações estão corretas. Documentos
+                validados podem ser exportados como PDF.</p>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="btnCancelValidate">Cancelar</button>
+                <button class="btn btn-success" id="btnConfirmValidate">✅ Validar como Médico Assistente</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toastContainer"></div>
+
+    <!-- ════════════════ SCRIPTS ════════════════ -->
+    <script src="./db.js"></script>
+    <script src="./lgpd.js"></script>
+    <script src="./recorder.js"></script>
+    <script src="./soap-engine.js"></script>
+    <script src="./documents.js"></script>
+    <script src="./bi-module.js"></script>
+    <script src="./export.js"></script>
+    <script src="./app.js"></script>
+
+</body>
+
+</html>
